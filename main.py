@@ -1,7 +1,6 @@
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
-#
-# Copyright (c) 2022 Robert Dale (Mistyhands)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-#
+# Copyright (c) 2022 Mistyhands
 #
 # This is a bot to manage the discord server for /r/vexillologycirclejerk.
 # It also mirrors posts from that subreddit.
@@ -21,14 +20,14 @@
 import asyncio
 import pickle
 import re
-import signal
 import sys
+from time import time
+import sys
+from discord import Colour, Forbidden, HTTPException, Reaction
 import toml
 import os.path
 import os
-from discord.commands import Option, slash_command, message_command
-from discord.ui import Button, View, Item
-from tabnanny import check
+from discord.commands import Option
 import psutil
 from discord.ext import tasks
 import pathlib
@@ -37,6 +36,9 @@ from collections import deque
 import discord
 import asyncpraw as praw
 import asyncprawcore
+from data import Data
+
+from ids import Channels, Roles, emoji_to_role
 
 global reddit, subreddit
 subreddit = None
@@ -44,8 +46,15 @@ subreddit = None
 base_dir = str(pathlib.Path(__file__).parent.resolve()) + '/'
 recent_posts_msgs = deque([])
 VCJ_GUILD = 847495460385849384
+if '-t' in sys.argv:
+    VCJ_GUILD = 929365821208272948
+
+REACT_THRESHOLD = 5
 
 cfg = ""
+
+d = Data()
+
 with open(base_dir + "config.toml") as t:
     cfg = toml.loads(t.read())
 
@@ -54,21 +63,6 @@ class ChannelNotFound(Exception):
     """Exception for not finding a channel ID.
     """
     pass
-
-
-class Channels():
-    """Named Discord channels to post to.
-    """
-    TESTING = 929365821908738080
-    REDDIT_POSTS = 939616386962030592
-    BOT_DEBUG = 939571508467073044
-    MISTYHANDS = 240903336717582337
-    BANS = 939598756523933777
-    MOD_ONLY = 939615965140893766
-
-
-class Roles():
-    MODERATOR = 939571086562050119
 
 
 def post_is_new(post_id: str) -> bool:
@@ -80,8 +74,8 @@ def post_is_new(post_id: str) -> bool:
     Returns:
         `bool`: whether the post has been posted
     """
-    for r_id, d_id in list(recent_posts_msgs):
-        if r_id == post_id or d_id == post_id:
+    for r_id, _ in d.get_recently_posted():
+        if r_id == post_id:
             return False
     return True
 
@@ -95,7 +89,7 @@ def get_recent_entry(index: int) -> tuple:
     Returns:
         tuple: the entry
     """
-    return recent_posts_msgs[index]
+    return d.get_recently_posted[index]
 
 
 def remember(post: praw.models.Submission, message: discord.Message):
@@ -107,13 +101,7 @@ def remember(post: praw.models.Submission, message: discord.Message):
         `post` (`praw.models.Submission`): the reddit post
         `message` (`discord.Message`): the discord message of the reddit post
     """
-    if len(recent_posts_msgs) > 50:
-        recent_posts_msgs.popleft()
-
-    post_message_tuple = (post.id, message.id)
-    if post_message_tuple not in recent_posts_msgs:
-        recent_posts_msgs.append(post_message_tuple)
-    store()
+    d.insert_reddit_post(post.id, message.id)
 
 
 def store():
@@ -170,44 +158,76 @@ def extract_url(input_string: str) -> str:
 
 
 class BannedUserButtonView(discord.ui.View):
+    """A template for a View which is used when prompting mods whether to ban a user.
+
+    Args:
+        (`discord.ui.View`): the View
+    """
+
     def __init__(self):
-        # making None is important if you want the button work after restart!
         super().__init__(timeout=None)
 
     @discord.ui.button(
         style=discord.ButtonStyle.red, custom_id="user_appeal:deny", label="Confirm", emoji='❌'
     )
-    async def deny_appeal(self, button, interaction: discord.Interaction):
+    async def confirm_ban(self, _, interaction: discord.Interaction):
+        """Confirm a user ban.
+
+        Args:
+            _ (`discord.User`): the user; discarded
+            `interaction` (`discord.Interaction`): the interaction of the message sent to the mod channel
+        """
         m: discord.Message = interaction.message
         emb = interaction.message.embeds[0]
-        emb = "Ban (confirmed)"
-        await interaction.response.edit_message(view=None, embed=emb)
-
-    @discord.ui.button(
-        style=discord.ButtonStyle.green, custom_id="user_appeal:approve", label="Unban user", emoji='✔️'
-    )
-    async def approve_appeal(self, button, interaction):
-        m: discord.Message = interaction.message.content
-        u_id = int(m.split('\n')[-1])
+        emb.title = "Banned"
+        reason = m.embeds[0].fields[0].value
+        u_id = int(m.content.split('\n')[-1])
         u = await client.fetch_user(u_id)
         g: discord.Guild = client.get_guild(VCJ_GUILD)
-        await g.unban(u)
+        try:
+            await g.ban(u, reason=reason)
+            await interaction.response.edit_message(view=None, embed=emb)
+        except (Forbidden, HTTPException) as e:
+            emb.title = "Failed to ban"
+            await interaction.response.edit_message(view=None, embed=emb, content="Couldn't ban, please ban manually.")
+
+    @discord.ui.button(
+        style=discord.ButtonStyle.green, custom_id="user_appeal:approve", label="Ignore", emoji='✔️'
+    )
+    async def dismiss_ban(self, _, interaction):
+        """Ignore a message warning and do not ban the user
+
+        Args:
+            _ (`discord.User`): the user; discarded
+            `interaction` (`discord.Interaction`): the interaction of the message sent to the mod channel
+        """
+        m: discord.Message = interaction.message.content
         emb = interaction.message.embeds[0]
-        emb.title = 'Unbanned'
+        emb.title = 'Ignored'
         emb.colour = discord.Colour.dark_green()
-        await interaction.response.edit_message(content="User unbanned.\nMake sure to notify them.", view=None, embed=emb)
+        await interaction.response.edit_message(content="OK, ignored.", view=None, embed=emb)
 
 
 class KeisatsuBot(discord.Bot):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        load()
+        #load()
         print(recent_posts_msgs)
         self.update_post_scores.start()
         self.check_memory_usage.start()
         self.check_new_posts.start()
 
         self.persistent_views_added = False
+
+        # TODO - make it clear which message is which
+        self.role_messages = [
+            940046766827528212,
+            940047479292964884,
+            940048241712566333,
+            940350126864625705,
+            943492168528592977
+        ]
+        self.emoji_to_role = emoji_to_role
 
     def _gen_embed(self, reddit_post: praw.models.Submission) -> discord.Embed:
         """Generate the embed for post notifications.
@@ -254,17 +274,37 @@ class KeisatsuBot(discord.Bot):
         return embed
 
     async def on_ready(self):
+        """Print to console when bot started.
+        Re-add previous buttons so their references aren't stale.
+        """
         self.add_view(BannedUserButtonView())
-        await self.get_channel(Channels.BOT_DEBUG).send(f"Bot started.")
         print(f"Connected: {self.user}")
 
         self.persistent_views_added = True
 
     async def submit_post(self, post: praw.models.Submission):
+        """Submit the post to #reddit-posts.
+
+        Args:
+            `post` (`praw.models.Submission`): the reddit post object
+
+        Returns:
+            `Coroutine[Any, Any, discord.Message]`: the message we just sent
+        """
         embed = self._gen_embed(post)
         return await self.get_channel(Channels.REDDIT_POSTS).send(embed=embed)
 
     async def _message_from_id(self, message_id: int, channel_id: int) -> discord.Message:
+        """Transform a message ID and a channel ID into a message object
+        that we can manipulate.
+
+        Args:
+            `message_id` (`int`): the message ID
+            `channel_id` (`int`): the channel ID
+
+        Returns:
+            discord.Message: the message object
+        """
         try:
             ch = self.get_channel(channel_id)
             if not ch:
@@ -275,16 +315,30 @@ class KeisatsuBot(discord.Bot):
             print(f"Invalid channel ID!")
             return None
         except discord.NotFound as e:
-            print(f"Invalid message ID!")
+            try:
+                for p_id, m_id in recent_posts_msgs:
+                    if m_id == message_id:
+                        recent_posts_msgs.remove(p_id, m_id)
+                        store()
+            except:
+                pass
             return None
 
-    async def autoban_user(self, user: discord.Member, reason: str):
+    async def prompt_user_ban(self, user: discord.Member, reason: str):
+        """Send a messge to the mod-only channel with buttons prompting
+        whether to ban a use for a message based on context. 
+
+        Args:
+            `user` (`discord.Member`): the user who sent a questionable message
+            `reason` (`str`): the reason the user would be banned for, as shown to the user
+                              currently: 'Message contained `bad_word` in `message containing bad_word`'.
+        """
         u: discord.Member = user
 
         view = BannedUserButtonView()
 
         embed = discord.Embed(
-            title="Ban",
+            title="Ban?",
             colour=discord.Colour.brand_red(),
         )
 
@@ -299,19 +353,22 @@ class KeisatsuBot(discord.Bot):
 
         ch_bans = client.get_channel(Channels.BANS)
         await ch_bans.send(view=view, embed=embed, content=f"ID:\n{u.id}")
-        await user.send(f"You have been automatically banned.\nIf this was in error, you will be unbanned and notified.\n\nReason:\n{reason}")
-        await user.ban(delete_message_days=3, reason=reason)
 
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)
     async def check_memory_usage(self):
-        mem_mib = get_memory_use()
-        if mem_mib > 256:
-            await self.get_channel(Channels.BOT_DEBUG).send(f"<@{Channels.MISTYHANDS}> Memory usage high!  (`{mem_mib}MiB`)\nIs there a leak?")
+        try:
+            mem_mib = get_memory_use()
+            if mem_mib > 256:
+                await self.get_channel(Channels.BOT_DEBUG).send(f"<@{Channels.MISTYHANDS}> Memory usage high!  (`{mem_mib}MiB`)\nIs there a leak?")
+                restart()
 
-    @tasks.loop(minutes=15)
+        except Exception as e:
+            pass
+
+    @tasks.loop(minutes=30)
     async def update_post_scores(self):
         print("Updating post messages.")
-        for r_id, d_id in list(recent_posts_msgs):
+        for r_id, d_id in d.get_recently_posted():
             post: praw.models.Submission = await submission_from_id(r_id)
             message = await self._message_from_id(d_id, Channels.REDDIT_POSTS)
 
@@ -322,8 +379,98 @@ class KeisatsuBot(discord.Bot):
                         f"Deleted message ID {message.id} due to removed reddit post {post.id}.")
                 else:
                     await message.edit(embed=self._gen_embed(post))
+            await asyncio.sleep(8)
 
-    @tasks.loop(minutes=5)
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Gives a role based on a reaction emoji."""
+        # Make sure that the message the user is reacting to is the one we care about.
+        if payload.message_id not in self.role_messages and payload.emoji.name != 'sun':
+            return
+
+        msg = await self._message_from_id(payload.message_id, payload.channel_id)
+        for r in msg.reactions:  # we have to iterate all reacts to find the amount : - (
+            if (r.count >= REACT_THRESHOLD and r.emoji == 'sun') \
+                and payload.emoji.name == 'sun' \
+                    and not d.exists_sunboard(payload.message_id):
+                u = msg.author
+                try:
+                    c = u.roles[0].colour
+                    if c is None:
+                        c = Colour.light_grey()
+                except:
+                    c = Colour.light_grey()
+
+                embed = discord.Embed(
+                    title=f'#{msg.channel.name}',
+                    colour=c,
+                    description=msg.content
+                )
+
+                n = u.nick if u.nick else u.name
+
+                if u.avatar is not None:
+                    embed.set_author(
+                        name=f'{n}', icon_url=u.avatar.url)
+                else:
+                    embed.set_author(name=f'{u.name}#{u.discriminator}')
+                dt_string = datetime.now().strftime("%H:%M %a %-d %b, %Y")
+                embed.set_footer(text=f"Time: {dt_string}")
+                if d.insert_sunboard(payload.message_id):
+                    await self.get_channel(Channels.SUNBOARD).send(embed=embed)
+
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return
+
+        try:
+            role_id = self.emoji_to_role[payload.emoji]
+        except KeyError:
+            return
+
+        role = guild.get_role(role_id)
+        if role is None:
+            return
+
+        try:
+            await payload.member.add_roles(role)
+
+        except discord.HTTPException:
+            pass
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        """Removes a role based on a reaction emoji."""
+        # Make sure that the message the user is reacting to is the one we care about.
+        if payload.message_id not in self.role_messages:
+            return
+
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            # Check if we're still in the guild and it's cached.
+            return
+
+        try:
+            role_id = self.emoji_to_role[payload.emoji]
+        except KeyError:
+            # If the emoji isn't the one we care about then exit as well.
+            return
+
+        role = guild.get_role(role_id)
+        if role is None:
+            # Make sure the role still exists and is valid.
+            return
+
+        # The payload for `on_raw_reaction_remove` does not provide `.member`
+        # so we must get the member ourselves from the payload's `.user_id`.
+        member = guild.get_member(payload.user_id)
+        if member is None:
+            return
+
+        try:
+            await member.remove_roles(role)
+        except discord.HTTPException:
+            pass
+
+    @tasks.loop(minutes=15)
     async def check_new_posts(self):
         print("Checking for posts.")
         try:
@@ -332,8 +479,12 @@ class KeisatsuBot(discord.Bot):
                 if post_is_new(post):
                     msg = await self.submit_post(post)
                     remember(post, msg)
+                await asyncio.sleep(10)
         except asyncprawcore.exceptions.ResponseException:
             print("Reddit error.")
+            await asyncio.sleep(30)
+        except Exception as e:
+            client.get_channel(Channels.BOT_DEBUG).send(str(e))
 
     @check_new_posts.before_loop
     async def before_checking_posts(self):
@@ -350,6 +501,7 @@ class KeisatsuBot(discord.Bot):
 
 intents = discord.Intents.default()
 intents.messages = True
+intents.members = True
 client = KeisatsuBot(intents=intents)
 
 
@@ -369,8 +521,30 @@ async def hello(
     await ctx.respond(f"Your request has been forwarded privately.", ephemeral=True)
 
 
+@client.slash_command(guild_ids=[929365821208272948], name="restart", description="restart")
+async def restart_cmd(
+    ctx: discord.ApplicationContext
+):
+    await ctx.respond(f"Restarting...", ephemeral=True)
+    restart()
+
+
+@client.slash_command(guild_ids=[929365821208272948, VCJ_GUILD], name="ping", description="Ping!")
+async def restart_cmd(
+    ctx: discord.ApplicationContext
+):
+    await ctx.respond(f"Pong!", ephemeral=True)
+
+
 @client.event
-async def on_message(message):
+async def on_message(message: discord.Message):
+    """Scan each message for a banned word.
+
+    Args:
+        `message` (`discord.Message`): the message that was sent
+    """
+
+    # Ignore our own messages
     if message.author == client.user:
         return
 
@@ -378,8 +552,16 @@ async def on_message(message):
     word = ""
     for word in cfg["options"]["badwords"]:
         if word.lower() in their_message.lower():
-            await client.autoban_user(message.author, f"Message contained: `{word.lower()}` in `{their_message}`.")
+            await client.prompt_user_ban(message.author, f"Message contained: `{word.lower()}` in `{their_message}`.")
             break
+
+
+def restart():
+    """Soft-restart the script so we don't need to reboot the entire VPS.
+    """
+    import sys
+    import os
+    os.execv(sys.executable, ['python3'] + sys.argv)
 
 
 reddit = praw.Reddit(
@@ -389,4 +571,14 @@ reddit = praw.Reddit(
 )
 
 
-client.run(cfg["keys"]["discord"])
+try:
+    client.run(cfg["keys"]["discord"])
+
+except Exception as e:
+    try:
+        client.get_channel(Channels.BOT_DEBUG).send(str(e))
+        restart()
+    except:
+        pass
+    time.sleep(30)
+print("Here!")
